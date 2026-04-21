@@ -2,6 +2,8 @@
 __pycache__/
 model
 continual_metrics.csv
+continual_class_tests.csv
+continual_accuracy_config.json
 continual_plots/
 pruning_metrics.csv
 high_loss_examples.csv
