@@ -1,0 +1,56 @@
+[data]
+csv_path = "../dataset/default of credit card clients.csv"
+target_column = "default payment next month"
+header_row = 1
+separator = ","
+drop_columns = ["ID"]
+feature_columns = []
+categorical_columns = []
+numeric_columns = []
+drop_unnamed_columns = true
+
+[split]
+train_size = 0.70
+val_size = 0.15
+test_size = 0.15
+random_seed = 42
+stratify = true
+
+[preprocessing]
+standardize_numeric = true
+one_hot_encode_categorical = true
+
+[model]
+hidden_layers = [32]
+grid = 5
+k = 3
+symbolic_enabled = false
+auto_save = false
+device = "cpu"
+
+[training]
+epochs = 40
+batch_size = 512
+learning_rate = 0.004
+weight_decay = 0.00001
+grid_update_epochs = 8
+patience = 10
+log_every = 5
+optimizer = "adam"
+class_weighting = "none"
+monitor = "roc_auc"
+
+[threshold]
+enabled = true
+metric = "f1"
+min = 0.05
+max = 0.95
+steps = 181
+default = 0.50
+
+[output]
+output_dir = "../artifacts/credit_default_kan"
+model_filename = "model.pt"
+preprocessor_filename = "preprocessor.pkl"
+metrics_filename = "metrics.json"
+config_snapshot_filename = "config.toml"

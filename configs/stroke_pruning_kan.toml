@@ -1,0 +1,68 @@
+[data]
+csv_path = "../dataset/healthcare-dataset-stroke-data.csv"
+target_column = "stroke"
+header_row = 0
+separator = ","
+drop_columns = ["id"]
+feature_columns = []
+categorical_columns = ["gender", "ever_married", "work_type", "Residence_type", "smoking_status"]
+numeric_columns = ["age", "hypertension", "heart_disease", "avg_glucose_level", "bmi"]
+drop_unnamed_columns = true
+
+[split]
+train_size = 0.70
+val_size = 0.15
+test_size = 0.15
+random_seed = 42
+stratify = true
+
+[preprocessing]
+standardize_numeric = true
+one_hot_encode_categorical = true
+impute_numeric = true
+numeric_imputation_strategy = "median"
+impute_categorical = true
+categorical_imputation_strategy = "most_frequent"
+categorical_fill_value = "missing"
+
+[model]
+hidden_layers = [16]
+grid = 5
+k = 3
+symbolic_enabled = false
+auto_save = false
+device = "cpu"
+
+[training]
+epochs = 40
+batch_size = 256
+learning_rate = 0.003
+weight_decay = 0.00001
+grid_update_epochs = 8
+patience = 10
+log_every = 5
+optimizer = "adam"
+class_weighting = "balanced"
+monitor = "roc_auc"
+
+[threshold]
+enabled = true
+metric = "f1"
+min = 0.05
+max = 0.95
+steps = 181
+default = 0.50
+
+[pruning]
+enabled = true
+probe_hidden = 24
+probe_epochs = 8
+keep_hidden_schedule = [4, 6, 8, 12, 16]
+epochs_per_model = 40
+
+[output]
+output_dir = "../artifacts/stroke_pruning_kan"
+model_filename = "model.pt"
+preprocessor_filename = "preprocessor.pkl"
+metrics_filename = "metrics.json"
+config_snapshot_filename = "config.toml"

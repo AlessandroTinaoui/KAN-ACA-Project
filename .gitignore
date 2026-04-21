@@ -23,3 +23,4 @@ conic_high_loss_examples.csv
 conic_run_config.json
 conic_model_final.pt
 conic_plots/
+artifacts/
