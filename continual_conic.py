@@ -68,6 +68,8 @@ ANTI_FORGETTING_PATIENCE = 5
 METRICS_OUT = "continual_metrics.csv"
 CLASS_TESTS_OUT = "continual_class_tests.csv"
 ACCURACY_CONFIG_OUT = "continual_accuracy_config.json"
+RUN_CONFIG_OUT = "continual_run_config.json"
+FINAL_MODEL_OUT = "continual_model_final.pt"
 STANDARDIZE = True
 PLOT_PREDICTIONS = True
 PLOT_DIR = "continual_plots"
@@ -75,6 +77,7 @@ PLOT_EXAMPLES = 2
 PLOT_LOSS = True
 PLOT_ERROR = True
 PLOT_CLASS_TESTS = True
+PLOT_CONFUSION_MATRICES = True
 PLOT_EDGE_FUNCTIONS = True
 
 # Each dictionary is one continual stage. The values say how many training
@@ -147,11 +150,19 @@ def standardize_from_train(
     train_indices: np.ndarray,
 ) -> np.ndarray:
     """Standardize the input coordinates using only training statistics."""
-    # We compute mean and standard deviation only from the training data.
+    mean, std = standardization_stats(features, train_indices)
+    return ((features - mean) / std).astype(np.float32)
+
+
+def standardization_stats(
+    features: np.ndarray,
+    train_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute standardization statistics using only the training rows."""
     mean = features[train_indices].mean(axis=0, keepdims=True)
     std = features[train_indices].std(axis=0, keepdims=True)
     std[std < 1e-6] = 1.0
-    return ((features - mean) / std).astype(np.float32)
+    return mean.astype(np.float32), std.astype(np.float32)
 
 
 def make_kan_dataset(
@@ -233,7 +244,7 @@ def make_balanced_dataloader(
     }
 
     if not present_counts:
-        raise ValueError("Lo stage corrente non contiene esempi di training.")
+        raise ValueError("The current stage does not contain any training examples.")
 
     # Minority classes receive larger sampling probability. We do not also use
     # CrossEntropy class weights, because that would count the same correction twice.
@@ -770,6 +781,94 @@ def plot_class_test_metrics(
     plt.close(fig)
 
 
+@torch.no_grad()
+def compute_confusion_matrix(
+    model: KAN,
+    features: np.ndarray,
+    labels: np.ndarray,
+    indices: np.ndarray,
+    device: torch.device,
+    class_ids: list[int],
+    active_classes: list[int] | None = None,
+) -> np.ndarray:
+    """Compute a raw-count confusion matrix for the selected class ids."""
+    if len(indices) == 0:
+        return np.zeros((len(class_ids), len(class_ids)), dtype=np.int64)
+
+    model.eval()
+    inputs = torch.tensor(features[indices], device=device)
+    logits = model(inputs)
+
+    if active_classes is not None:
+        active = active_class_tensor(active_classes, device)
+        logits = logits.index_select(dim=1, index=active)
+        predicted_positions = logits.argmax(dim=1)
+        predictions = active[predicted_positions].cpu().numpy()
+    else:
+        predictions = logits.argmax(dim=1).cpu().numpy()
+
+    true_labels = labels[indices]
+    class_to_position = {class_id: position for position, class_id in enumerate(class_ids)}
+    matrix = np.zeros((len(class_ids), len(class_ids)), dtype=np.int64)
+
+    for true_label, predicted_label in zip(true_labels, predictions):
+        true_position = class_to_position.get(int(true_label))
+        predicted_position = class_to_position.get(int(predicted_label))
+
+        if true_position is not None and predicted_position is not None:
+            matrix[true_position, predicted_position] += 1
+
+    return matrix
+
+
+def save_confusion_matrix(
+    matrix: np.ndarray,
+    class_names: list[str],
+    output_dir: Path,
+    stage: int,
+    task_name: str,
+) -> tuple[Path, Path]:
+    """Save one confusion matrix as both CSV and PNG."""
+    confusion_dir = output_dir / "confusion_matrices"
+    confusion_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_task_name = task_name.replace("+", "_")
+    csv_path = confusion_dir / f"stage_{stage:02d}_{safe_task_name}_confusion.csv"
+    image_path = confusion_dir / f"stage_{stage:02d}_{safe_task_name}_confusion.png"
+
+    frame = pd.DataFrame(
+        matrix,
+        index=[f"true_{name}" for name in class_names],
+        columns=[f"pred_{name}" for name in class_names],
+    )
+    frame.to_csv(csv_path)
+
+    size = max(5.0, 1.2 * len(class_names))
+    fig, ax = plt.subplots(figsize=(size, size), constrained_layout=True)
+    image = ax.imshow(matrix, cmap="Blues")
+    ax.set_title(f"Stage {stage}: {task_name}")
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("True class")
+    ax.set_xticks(np.arange(len(class_names)))
+    ax.set_yticks(np.arange(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=30, ha="right")
+    ax.set_yticklabels(class_names)
+
+    max_value = int(matrix.max()) if matrix.size else 0
+    threshold = max_value / 2 if max_value > 0 else 0
+    for row in range(matrix.shape[0]):
+        for col in range(matrix.shape[1]):
+            value = int(matrix[row, col])
+            color = "white" if value > threshold else "black"
+            ax.text(col, row, str(value), ha="center", va="center", color=color)
+
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    fig.savefig(image_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    return csv_path, image_path
+
+
 def edge_function_summary(
     model: KAN,
     input_names: list[str],
@@ -922,15 +1021,15 @@ def make_optimizer(model: KAN) -> torch.optim.Optimizer:
         return torch.optim.AdamW(params, lr=LEARNING_RATE)
 
     raise ValueError(
-        "Il loop con WeightedRandomSampler usa mini-batch PyTorch: "
-        "imposta OPTIMIZER a 'Adam' oppure 'AdamW'."
+        "The WeightedRandomSampler loop uses PyTorch mini-batches: "
+        "set OPTIMIZER to 'Adam' or 'AdamW'."
     )
 
 
 def epochs_for_stage(stage: int) -> int:
     """Return how many epochs should be used for one continual stage."""
     if not EPOCHS_PER_TASK:
-        raise ValueError("EPOCHS_PER_TASK deve contenere almeno un valore.")
+        raise ValueError("EPOCHS_PER_TASK must contain at least one value.")
 
     if stage <= len(EPOCHS_PER_TASK):
         epochs = int(EPOCHS_PER_TASK[stage - 1])
@@ -938,7 +1037,7 @@ def epochs_for_stage(stage: int) -> int:
         epochs = int(EPOCHS_PER_TASK[-1])
 
     if epochs <= 0:
-        raise ValueError(f"Numero di epoche non valido per lo stage {stage}: {epochs}")
+        raise ValueError(f"Invalid number of epochs for stage {stage}: {epochs}")
 
     return epochs
 
@@ -1260,18 +1359,18 @@ def parse_training_schedule(
 
     if unknown:
         valid = ", ".join(shape_names)
-        raise ValueError(f"Task sconosciuti: {unknown}. Task validi: {valid}")
+        raise ValueError(f"Unknown tasks: {unknown}. Valid tasks: {valid}")
 
     parsed_schedule = []
     for stage_index, stage in enumerate(training_schedule, start=1):
         if not stage:
-            raise ValueError(f"Lo stage {stage_index} non contiene classi.")
+            raise ValueError(f"Stage {stage_index} does not contain any classes.")
 
         parsed_stage = {}
         for name, count in stage.items():
             if count <= 0:
                 raise ValueError(
-                    f"Lo stage {stage_index} ha un conteggio non valido per {name}: {count}"
+                    f"Stage {stage_index} has an invalid count for {name}: {count}"
                 )
             parsed_stage[name_to_id[name]] = int(count)
 
@@ -1374,6 +1473,113 @@ def save_accuracy_config(
         config_file.write("\n")
 
 
+def named_training_schedule(
+    training_schedule: list[dict[int, int]],
+    shape_names: list[str],
+) -> list[dict[str, object]]:
+    """Turn the parsed schedule back into a readable JSON structure."""
+    return [
+        {
+            "stage": stage,
+            "class_counts": {
+                shape_names[class_id]: int(count)
+                for class_id, count in stage_counts.items()
+            },
+        }
+        for stage, stage_counts in enumerate(training_schedule, start=1)
+    ]
+
+
+def build_run_config(
+    input_names: list[str],
+    shape_names: list[str],
+    training_schedule: list[dict[int, int]],
+    device: torch.device,
+    model_output_path: Path,
+    standardization_mean: np.ndarray,
+    standardization_std: np.ndarray,
+) -> dict[str, object]:
+    """Collect the experiment setup needed to reproduce the run."""
+    return {
+        "data_path": str(DATA_PATH),
+        "device": str(device),
+        "input_names": input_names,
+        "shape_names": shape_names,
+        "class_to_id": {
+            shape_name: class_id
+            for class_id, shape_name in enumerate(shape_names)
+        },
+        "model_output": str(model_output_path),
+        "model": {
+            "hidden": HIDDEN,
+            "grid": GRID,
+            "spline_order": SPLINE_ORDER,
+            "optimizer": OPTIMIZER,
+            "learning_rate": LEARNING_RATE,
+            "min_learning_rate": MIN_LEARNING_RATE,
+            "batch_size": BATCH_SIZE,
+        },
+        "continual_learning": {
+            "epochs_per_task": EPOCHS_PER_TASK,
+            "mask_future_classes": MASK_FUTURE_CLASSES,
+            "label_smoothing": LABEL_SMOOTHING,
+            "use_balanced_sampler": USE_BALANCED_SAMPLER,
+            "use_lwf": USE_LWF,
+            "initial_lambda_kd": INITIAL_LAMBDA_KD,
+            "lambda_kd_decay": LAMBDA_KD_DECAY,
+            "distillation_temperature": DISTILLATION_TEMPERATURE,
+            "training_schedule": named_training_schedule(
+                training_schedule,
+                shape_names,
+            ),
+        },
+        "early_stopping": {
+            "validation_loss_enabled": EARLY_STOPPING,
+            "check_every": EARLY_STOPPING_CHECK_EVERY,
+            "patience": EARLY_STOPPING_PATIENCE,
+            "min_delta": EARLY_STOPPING_MIN_DELTA,
+            "anti_forgetting_enabled": ANTI_FORGETTING_EARLY_STOPPING,
+            "anti_forgetting_tolerance": ANTI_FORGETTING_TOLERANCE,
+            "anti_forgetting_patience": ANTI_FORGETTING_PATIENCE,
+        },
+        "standardization": {
+            "enabled": STANDARDIZE,
+            "mean": standardization_mean.reshape(-1).astype(float).tolist(),
+            "std": standardization_std.reshape(-1).astype(float).tolist(),
+        },
+        "outputs": {
+            "metrics_csv": METRICS_OUT,
+            "class_tests_csv": CLASS_TESTS_OUT,
+            "accuracy_config_json": ACCURACY_CONFIG_OUT,
+            "run_config_json": RUN_CONFIG_OUT,
+            "plot_dir": PLOT_DIR,
+        },
+    }
+
+
+def save_run_config(
+    run_config: dict[str, object],
+    output_path: Path,
+) -> None:
+    """Save the full experiment configuration as JSON."""
+    with output_path.open("w", encoding="utf-8") as config_file:
+        json.dump(run_config, config_file, indent=2)
+        config_file.write("\n")
+
+
+def save_final_model(
+    model: KAN,
+    output_path: Path,
+    run_config: dict[str, object],
+) -> None:
+    """Save the final KAN weights together with the run configuration."""
+    checkpoint = {
+        "state_dict": model.state_dict(),
+        "run_config": run_config,
+    }
+    torch.save(checkpoint, output_path)
+
+
 def train_continual() -> pd.DataFrame:
     """Run the full continual learning experiment from data loading to reports."""
     torch.manual_seed(SEED)
@@ -1391,9 +1597,17 @@ def train_continual() -> pd.DataFrame:
 
     # 2. Scaling the coordinates usually makes training easier for the model.
     if STANDARDIZE:
-        features = standardize_from_train(raw_features, train_indices)
+        standardization_mean, standardization_std = standardization_stats(
+            raw_features,
+            train_indices,
+        )
+        features = ((raw_features - standardization_mean) / standardization_std).astype(
+            np.float32
+        )
     else:
         features = raw_features
+        standardization_mean = np.zeros((1, raw_features.shape[1]), dtype=np.float32)
+        standardization_std = np.ones((1, raw_features.shape[1]), dtype=np.float32)
 
     # 3. Parse the schedule and remember the order in which classes appear.
     training_schedule = parse_training_schedule(TRAINING_SCHEDULE, shape_names)
@@ -1494,12 +1708,12 @@ def train_continual() -> pd.DataFrame:
         print()
         print(
             f"Task {stage}/{len(training_schedule)}: {task_name} "
-            f"({len(current_train_indices)} esempi di training)"
+            f"({len(current_train_indices)} training examples)"
         )
         print(f"Epochs: {stage_epochs}, lambda_kd: {stage_lambda_kd:.4f}")
         if active_classes_for_stage is not None:
             active_names = [shape_names[class_id] for class_id in active_classes_for_stage]
-            print(f"Classi attive nella loss: {active_names}")
+            print(f"Active classes in the loss: {active_names}")
         train_counts = count_by_class(current_train_indices, labels, shape_names)
         train_mix = " | ".join(
             f"{shape_names[item]}={train_counts[shape_names[item]]}" for item in seen_classes
@@ -1507,7 +1721,7 @@ def train_continual() -> pd.DataFrame:
         print(f"Training mix: {train_mix}")
         if teacher_model is not None:
             old_names = [shape_names[class_id] for class_id in previous_classes]
-            print(f"LwF teacher sulle classi vecchie: {old_names}")
+            print(f"LwF teacher on previous classes: {old_names}")
 
         stage_class_counts = count_by_class_id(
             indices=current_train_indices,
@@ -1643,8 +1857,8 @@ def train_continual() -> pd.DataFrame:
             f"{shape_names[item]}={record[f'acc_{shape_names[item]}']:.3f}"
             for item in seen_classes
         )
-        print(f"Accuracy viste: mean={record['mean_seen_accuracy']:.3f} | {per_task}")
-        print(f"Test separati: {' | '.join(separate_test_summary)}")
+        print(f"Seen accuracy: mean={record['mean_seen_accuracy']:.3f} | {per_task}")
+        print(f"Separate tests: {' | '.join(separate_test_summary)}")
         print(
             "Early stopping: "
             f"best_step={record['best_step']}, "
@@ -1655,6 +1869,26 @@ def train_continual() -> pd.DataFrame:
             f"reason={record['stop_reason']}, "
             f"best_old_acc={record['best_old_class_accuracy']:.3f}"
         )
+
+        if PLOT_CONFUSION_MATRICES:
+            confusion_matrix = compute_confusion_matrix(
+                model=model,
+                features=features,
+                labels=labels,
+                indices=seen_test_indices,
+                device=device,
+                class_ids=seen_classes,
+                active_classes=active_classes_for_stage,
+            )
+            confusion_csv, confusion_image = save_confusion_matrix(
+                matrix=confusion_matrix,
+                class_names=[shape_names[class_id] for class_id in seen_classes],
+                output_dir=plot_dir,
+                stage=stage,
+                task_name=task_name,
+            )
+            print(f"Confusion matrix saved to: {confusion_image}")
+            print(f"Confusion matrix CSV saved to: {confusion_csv}")
 
         if PLOT_PREDICTIONS:
             plot_stage_predictions(
@@ -1673,16 +1907,16 @@ def train_continual() -> pd.DataFrame:
                 seed=SEED,
                 active_classes=active_classes_for_stage,
             )
-            print(f"Plot predizioni salvato in: {plot_dir}")
+            print(f"Prediction plots saved in: {plot_dir}")
 
     if PLOT_LOSS:
         plot_continual_losses(loss_history, plot_dir)
-        print(f"Plot loss continual learning salvato in: {plot_dir / 'continual_loss.png'}")
+        print(f"Continual loss plot saved to: {plot_dir / 'continual_loss.png'}")
         final_loss_paths = save_final_loss_summary(loss_history, plot_dir)
         if final_loss_paths is not None:
             final_loss_csv, final_loss_json = final_loss_paths
-            print(f"Loss finali salvate in: {final_loss_csv}")
-            print(f"Loss finali JSON salvate in: {final_loss_json}")
+            print(f"Final loss summary saved to: {final_loss_csv}")
+            print(f"Final loss JSON saved to: {final_loss_json}")
 
     # 6. Convert the collected dictionaries into CSV-friendly DataFrames.
     metrics = pd.DataFrame(records)
@@ -1690,11 +1924,11 @@ def train_continual() -> pd.DataFrame:
 
     if PLOT_ERROR:
         plot_continual_error(records, plot_dir)
-        print(f"Plot error continual learning salvato in: {plot_dir / 'continual_error.png'}")
+        print(f"Continual error plot saved to: {plot_dir / 'continual_error.png'}")
 
     if PLOT_CLASS_TESTS:
         plot_class_test_metrics(class_test_metrics, plot_dir)
-        print(f"Plot test separati salvato in: {plot_dir / 'continual_class_tests.png'}")
+        print(f"Separate class test plot saved to: {plot_dir / 'continual_class_tests.png'}")
 
     if PLOT_EDGE_FUNCTIONS:
         sample_input = torch.tensor(features[train_indices], device=device)
@@ -1708,8 +1942,8 @@ def train_continual() -> pd.DataFrame:
             output_names=shape_names,
             title="Final continual KAN edge functions",
         )
-        print(f"Funzioni finali sugli archi salvate in: {edge_image_path}")
-        print(f"Tabella archi attivi salvata in: {edge_table_path}")
+        print(f"Final edge-function plot saved to: {edge_image_path}")
+        print(f"Active-edge table saved to: {edge_table_path}")
 
     final_record = records[-1]
     forgetting_values = []
@@ -1720,7 +1954,7 @@ def train_continual() -> pd.DataFrame:
     # 7. Forgetting compares the best past accuracy with the final accuracy for
     # each class. Low forgetting means the model kept old knowledge.
     print()
-    print("Forgetting finale:")
+    print("Final forgetting:")
     for class_id in task_class_order:
         column = f"acc_{shape_names[class_id]}"
         values = [record[column] for record in records if column in record]
@@ -1741,8 +1975,40 @@ def train_continual() -> pd.DataFrame:
         )
 
     mean_forgetting = float(np.mean(forgetting_values)) if forgetting_values else float("nan")
-    print(f"Forgetting medio: {mean_forgetting:.3f}")
-    print(f"Accuracy finale media sui task visti: {final_record['mean_seen_accuracy']:.3f}")
+    print(f"Mean forgetting: {mean_forgetting:.3f}")
+    print(f"Final mean accuracy on seen tasks: {final_record['mean_seen_accuracy']:.3f}")
+
+    final_model_path = ROOT_DIR / FINAL_MODEL_OUT
+    run_config_path = ROOT_DIR / RUN_CONFIG_OUT
+    run_config = build_run_config(
+        input_names=input_names,
+        shape_names=shape_names,
+        training_schedule=training_schedule,
+        device=device,
+        model_output_path=final_model_path,
+        standardization_mean=standardization_mean,
+        standardization_std=standardization_std,
+    )
+    run_config["final_results"] = {
+        "mean_forgetting": json_number(mean_forgetting),
+        "final_mean_seen_accuracy": json_number(final_record["mean_seen_accuracy"]),
+        "best_accuracy_by_class": {
+            class_name: json_number(value)
+            for class_name, value in best_accuracy_by_class.items()
+        },
+        "final_accuracy_by_class": {
+            class_name: json_number(value)
+            for class_name, value in final_accuracy_by_class.items()
+        },
+        "forgetting_by_class": {
+            class_name: json_number(value)
+            for class_name, value in forgetting_by_class.items()
+        },
+    }
+    save_final_model(model, final_model_path, run_config)
+    save_run_config(run_config, run_config_path)
+    print(f"Final model checkpoint saved to: {final_model_path}")
+    print(f"Run configuration saved to: {run_config_path}")
 
     if ACCURACY_CONFIG_OUT:
         accuracy_config_path = ROOT_DIR / ACCURACY_CONFIG_OUT
@@ -1757,17 +2023,17 @@ def train_continual() -> pd.DataFrame:
             mean_forgetting=mean_forgetting,
         )
         save_accuracy_config(accuracy_config, accuracy_config_path)
-        print(f"Config accuracy salvata in: {accuracy_config_path}")
+        print(f"Accuracy config saved to: {accuracy_config_path}")
 
     if METRICS_OUT:
         metrics_path = ROOT_DIR / METRICS_OUT
         metrics.to_csv(metrics_path, index=False)
-        print(f"Metriche salvate in: {metrics_path}")
+        print(f"Metrics saved to: {metrics_path}")
 
     if CLASS_TESTS_OUT:
         class_tests_path = ROOT_DIR / CLASS_TESTS_OUT
         class_test_metrics.to_csv(class_tests_path, index=False)
-        print(f"Test separati salvati in: {class_tests_path}")
+        print(f"Separate class tests saved to: {class_tests_path}")
 
     return metrics
 
@@ -1775,7 +2041,7 @@ def train_continual() -> pd.DataFrame:
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         raise SystemExit(
-            "Questo script non accetta parametri da terminale: modifica il blocco CONFIG."
+            "This script does not accept command-line arguments: edit the CONFIG block."
         )
 
     train_continual()
