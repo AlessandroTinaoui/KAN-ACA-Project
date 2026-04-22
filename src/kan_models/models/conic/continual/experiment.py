@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 
 from kan_models.models.conic.config import ContinualConfig
-from kan_models.models.conic.continual.config import DEFAULT_CONFIG_PATH, load_continual_config
+from kan_models.models.conic.continual.config import CONTINUAL_CONFIG_VARIANTS, DEFAULT_CONFIG_PATH, load_continual_config
 from kan_models.models.conic.continual.plotting import plot_class_test_metrics, plot_continual_error, plot_continual_losses, plot_stage_predictions
 from kan_models.models.conic.continual.training import (
     epochs_for_stage,
@@ -501,15 +501,37 @@ def run_continual(config_path: str | Path = DEFAULT_CONFIG_PATH) -> pd.DataFrame
     return metrics
 
 
+def resolve_cli_config(config_path: str | None, variant: str | None, default_config: str | Path) -> Path:
+    """Choose the TOML config from either --config, --variant, or the default path."""
+    if config_path:
+        return Path(config_path)
+
+    if variant:
+        return CONTINUAL_CONFIG_VARIANTS[variant]
+
+    return Path(default_config)
+
+
 def main(argv: list[str] | None = None, default_config: str | Path = DEFAULT_CONFIG_PATH) -> int:
     parser = argparse.ArgumentParser(description="Run the continual conic KAN experiment.")
     parser.add_argument(
         "--config",
-        default=str(default_config),
-        help=f"Path to the TOML config file. Default: {default_config}",
+        default=None,
+        help="Path to a custom TOML config file. If provided, it overrides --variant.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=sorted(CONTINUAL_CONFIG_VARIANTS),
+        default=None,
+        help=(
+            "Built-in continual config to run. "
+            "Use 'standard' for continual.toml or 'reversed' for continual_reversed.toml."
+        ),
     )
     args = parser.parse_args(argv)
-    run_continual(args.config)
+    selected_config = resolve_cli_config(args.config, args.variant, default_config)
+    print(f"Continual config: {selected_config}")
+    run_continual(selected_config)
     return 0
 
 

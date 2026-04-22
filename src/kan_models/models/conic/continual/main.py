@@ -12,10 +12,16 @@ from kan_models.common.runtime import configure_matplotlib
 
 configure_matplotlib()
 
-from kan_models.models.conic.continual.config import DEFAULT_CONFIG_PATH
+from kan_models.models.conic.continual.config import CONTINUAL_CONFIG_VARIANTS, DEFAULT_CONFIG_PATH, DEFAULT_REVERSED_CONFIG_PATH
 from kan_models.models.conic.continual.experiment import main, run_continual
 
-__all__ = ["DEFAULT_CONFIG_PATH", "main", "run_continual"]
+__all__ = [
+    "CONTINUAL_CONFIG_VARIANTS",
+    "DEFAULT_CONFIG_PATH",
+    "DEFAULT_REVERSED_CONFIG_PATH",
+    "main",
+    "run_continual",
+]
 
 
 if __name__ == "__main__":
