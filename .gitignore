@@ -16,6 +16,7 @@ continual_plots_reversed/
 pruning_metrics.csv
 high_loss_examples.csv
 pruning_plots/
+.codex
 copy_temp*
 conic_metrics.csv
 conic_class_tests.csv

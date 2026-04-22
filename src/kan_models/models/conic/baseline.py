@@ -1,21 +1,10 @@
-"""Single-task KAN baseline for the conic-section dataset.
-
-This script trains one KAN on all classes at the same time. It is useful as a
-baseline for the continual-learning and pruning experiments, because it tells us
-how well the same model family performs when it does not have to learn tasks in
-sequence.
-"""
+"""Single-task baseline for the conic-section dataset."""
 
 from __future__ import annotations
 
-import json
-import shutil
-import sys
+import argparse
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -23,59 +12,28 @@ import torch
 from kan import KAN
 from tqdm import tqdm
 
-from continual_conic import (
-    DATA_PATH,
-    ROOT_DIR,
-    accuracy,
-    compute_confusion_matrix,
-    load_feature_names,
+from kan_models.models.conic.config import BaselineConfig, load_baseline_config
+from kan_models.models.conic.data import (
     load_conic_csv,
+    load_feature_names,
     make_kan_dataset,
-    plot_kan_edge_functions,
-    save_confusion_matrix,
-    save_final_loss_summary,
-    sqrt_cross_entropy_loss,
     standardization_stats,
     stratified_split,
 )
-from pruning_conic import (
+from kan_models.models.conic.modeling import accuracy, build_model, compute_confusion_matrix
+from kan_models.models.conic.plotting import (
     high_loss_examples,
     plot_high_loss_examples,
+    plot_kan_edge_functions,
     plot_prediction_examples,
+    save_confusion_matrix,
+    save_final_loss_summary,
 )
+from kan_models.common.runtime import detect_device
+from kan_models.common.shared import clone_state_dict, clear_directory, write_json
 
 
-# CONFIG
-# This is the plain all-classes baseline, not a continual-learning run.
-HIDDEN = 6
-GRID = 3
-SPLINE_ORDER = 3
-SEED = 1
-TEST_RATIO = 0.2
-OPTIMIZER = "AdamW"
-LEARNING_RATE = 0.01
-MIN_LEARNING_RATE = 1e-5
-WEIGHT_DECAY = 1e-4
-STEPS = 100
-LABEL_SMOOTHING = 0.1
-EARLY_STOPPING_PATIENCE = 10
-EARLY_STOPPING_MIN_DELTA = 1e-4
-LR_SCHEDULER_FACTOR = 0.5
-LR_SCHEDULER_PATIENCE = 3
-GRID_UPDATE_EVERY = 10
-STOP_GRID_UPDATE_STEP = 30
-STANDARDIZE = True
-
-PLOT_DIR = "conic_plots"
-PLOT_EXAMPLES = 2
-HIGH_LOSS_EXAMPLES = 12
-CLEAR_OLD_PLOTS = True
-
-METRICS_OUT = "conic_metrics.csv"
-CLASS_TESTS_OUT = "conic_class_tests.csv"
-HIGH_LOSS_OUT = "conic_high_loss_examples.csv"
-RUN_CONFIG_OUT = "conic_run_config.json"
-FINAL_MODEL_OUT = "conic_model_final.pt"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[4] / "configs" / "conic" / "baseline.toml"
 
 
 @torch.no_grad()
@@ -86,7 +44,7 @@ def cross_entropy_loss(
     indices: np.ndarray,
     device: torch.device,
 ) -> float:
-    """Compute plain CrossEntropyLoss on a fixed split."""
+    """Compute CrossEntropyLoss on a fixed split."""
     model.eval()
     inputs = torch.tensor(features[indices], device=device)
     targets = torch.tensor(labels[indices], device=device)
@@ -95,43 +53,61 @@ def cross_entropy_loss(
 
 
 @torch.no_grad()
-def tensor_cross_entropy_loss(
-    model: KAN,
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-) -> torch.Tensor:
-    """Compute plain CrossEntropyLoss on already-built tensors."""
+def tensor_cross_entropy_loss(model: KAN, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Compute CrossEntropyLoss on already-built tensors."""
     model.eval()
     logits = model(inputs)
     return torch.nn.functional.cross_entropy(logits, targets)
 
 
-def clone_state_dict(model: KAN) -> dict[str, torch.Tensor]:
-    """Clone the trainable state so early stopping can restore the best model."""
-    return {
-        name: value.detach().clone()
-        for name, value in model.state_dict().items()
-    }
+def build_optimizer(model: KAN, config: BaselineConfig) -> torch.optim.Optimizer:
+    """Build the optimizer configured for the baseline run."""
+    training = config.training
+    params = model.get_params() if hasattr(model, "get_params") else model.parameters()
+    optimizer_name = training.optimizer.lower()
+    if optimizer_name == "adam":
+        return torch.optim.Adam(params, lr=training.learning_rate, weight_decay=training.weight_decay)
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(params, lr=training.learning_rate, weight_decay=training.weight_decay)
+    raise ValueError(f"Unsupported baseline optimizer: {training.optimizer}")
+
+
+def build_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: BaselineConfig,
+) -> tuple[object, str]:
+    """Build the learning-rate scheduler and describe how it should be stepped."""
+    training = config.training
+    scheduler_name = training.lr_scheduler.lower()
+    if scheduler_name == "reducelronplateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=training.lr_scheduler_factor,
+            patience=training.lr_scheduler_patience,
+            min_lr=training.min_learning_rate,
+        )
+        return scheduler, "metric"
+    if scheduler_name == "cosineannealinglr":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, training.steps),
+            eta_min=training.min_learning_rate,
+        )
+        return scheduler, "step"
+    raise ValueError(f"Unsupported baseline lr_scheduler: {training.lr_scheduler}")
 
 
 def train_with_early_stopping(
     model: KAN,
     dataset: dict[str, torch.Tensor],
+    config: BaselineConfig,
 ) -> tuple[KAN, dict[str, list | float | int | bool | str]]:
-    """Train with AdamW, label smoothing, ReduceLROnPlateau, and strict stopping."""
-    loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
-    optimizer = torch.optim.AdamW(
-        model.get_params() if hasattr(model, "get_params") else model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=LR_SCHEDULER_FACTOR,
-        patience=LR_SCHEDULER_PATIENCE,
-        min_lr=MIN_LEARNING_RATE,
-    )
+    """Train the baseline KAN with configurable optimizer, scheduler, and strict stopping."""
+    training = config.training
+    loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=training.label_smoothing)
+    optimizer = build_optimizer(model, config)
+    scheduler, scheduler_step_mode = build_lr_scheduler(optimizer, config)
 
     train_input = dataset["train_input"]
     train_label = dataset["train_label"]
@@ -157,16 +133,14 @@ def train_with_early_stopping(
         "stop_reason": "max_steps",
     }
 
-    pbar = tqdm(range(1, STEPS + 1), desc="single-task training", ncols=100)
+    pbar = tqdm(range(1, training.steps + 1), desc="single-task training", ncols=100)
     for step in pbar:
         model.train()
 
-        # KAN grids can adapt to the data early on. After a few updates we stop
-        # moving the grid and let AdamW refine the spline coefficients safely.
         if (
-            GRID_UPDATE_EVERY > 0
-            and step <= STOP_GRID_UPDATE_STEP
-            and (step == 1 or (step - 1) % GRID_UPDATE_EVERY == 0)
+            training.grid_update_every > 0
+            and step <= training.stop_grid_update_step
+            and (step == 1 or (step - 1) % training.grid_update_every == 0)
         ):
             with torch.no_grad():
                 model.update_grid(train_input)
@@ -179,12 +153,15 @@ def train_with_early_stopping(
 
         train_ce = tensor_cross_entropy_loss(model, train_input, train_label)
         test_ce = tensor_cross_entropy_loss(model, test_input, test_label)
-        scheduler.step(float(test_ce.cpu()))
+        test_ce_value = float(test_ce.cpu())
+        if scheduler_step_mode == "metric":
+            scheduler.step(test_ce_value)
+        else:
+            scheduler.step()
 
         train_ce_value = float(train_ce.cpu())
-        test_ce_value = float(test_ce.cpu())
-        train_loss = float(torch.sqrt(train_ce).cpu())
-        test_loss = float(torch.sqrt(test_ce).cpu())
+        train_loss = train_ce_value
+        test_loss = test_ce_value
         current_lr = float(optimizer.param_groups[0]["lr"])
 
         results["train_loss"].append(train_loss)
@@ -194,7 +171,7 @@ def train_with_early_stopping(
         results["train_objective_loss"].append(float(objective_loss.detach().cpu()))
         results["learning_rate"].append(current_lr)
 
-        if test_ce_value < best_test_ce - EARLY_STOPPING_MIN_DELTA:
+        if test_ce_value < best_test_ce - training.early_stopping_min_delta:
             best_test_ce = test_ce_value
             best_state = clone_state_dict(model)
             best_step = step
@@ -207,7 +184,7 @@ def train_with_early_stopping(
             % (train_loss, test_loss, current_lr, best_step)
         )
 
-        if steps_without_improvement >= EARLY_STOPPING_PATIENCE:
+        if steps_without_improvement >= training.early_stopping_patience:
             stopped_early = True
             results["stop_reason"] = "validation_loss_plateau"
             break
@@ -218,25 +195,20 @@ def train_with_early_stopping(
     results["stopped_early"] = stopped_early
     results["trained_steps"] = len(results["train_loss"])
     results["final_learning_rate"] = (
-        results["learning_rate"][-1] if results["learning_rate"] else LEARNING_RATE
+        results["learning_rate"][-1] if results["learning_rate"] else training.learning_rate
     )
-
     return model, results
 
 
-def clear_output_dir(output_dir: Path) -> None:
-    """Remove old plots from a previous baseline run."""
-    if output_dir.exists() and CLEAR_OLD_PLOTS:
-        shutil.rmtree(output_dir)
-
+def clear_output_dir(output_dir: Path, enabled: bool) -> None:
+    """Remove plots from a previous baseline run if requested."""
+    if output_dir.exists() and enabled:
+        clear_directory(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
 
-def plot_loss_curve(
-    results: dict[str, list],
-    output_file: Path,
-) -> None:
-    """Plot train and test loss from the manual PyTorch loop."""
+def plot_loss_curve(results: dict[str, list], output_file: Path) -> None:
+    """Plot train and test cross-entropy loss from the manual PyTorch loop."""
     train_loss = np.asarray(results["train_loss"], dtype=float)
     test_loss = np.asarray(results["test_loss"], dtype=float)
     steps = np.arange(1, len(train_loss) + 1)
@@ -249,17 +221,14 @@ def plot_loss_curve(
         ax.axvline(best_step, color="#b85042", linestyle=":", label=f"best step {best_step}")
     ax.set_title("Single-task KAN loss")
     ax.set_xlabel("Optimization step")
-    ax.set_ylabel("sqrt(CrossEntropyLoss)")
+    ax.set_ylabel("CrossEntropyLoss")
     ax.grid(True, linewidth=0.4, alpha=0.35)
     ax.legend()
     fig.savefig(output_file, dpi=180)
     plt.close(fig)
 
 
-def plot_class_test_metrics(
-    class_test_frame: pd.DataFrame,
-    output_file: Path,
-) -> None:
+def plot_class_test_metrics(class_test_frame: pd.DataFrame, output_file: Path) -> None:
     """Plot per-class test loss and accuracy for the baseline model."""
     if class_test_frame.empty:
         return
@@ -270,7 +239,7 @@ def plot_class_test_metrics(
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8), constrained_layout=True)
     axes[0].bar(x, class_test_frame["test_loss"], color="#5b7c99")
     axes[0].set_title("Test loss by class")
-    axes[0].set_ylabel("sqrt(CrossEntropyLoss)")
+    axes[0].set_ylabel("CrossEntropyLoss")
 
     axes[1].bar(x, class_test_frame["test_accuracy"], color="#2a9d8f")
     axes[1].set_title("Test accuracy by class")
@@ -288,153 +257,93 @@ def plot_class_test_metrics(
 
 def model_quality_verdict(test_accuracy: float, test_loss: float) -> tuple[str, str]:
     """Return a short qualitative verdict based on accuracy and loss."""
-    if test_accuracy >= 0.97 and test_loss <= 0.50:
-        return (
-            "good",
-            "The model is strong: high test accuracy and low confidence penalty.",
-        )
-
-    if test_accuracy >= 0.93 and test_loss <= 0.75:
-        return (
-            "acceptable",
-            "The model is usable, but confidence or a few classes may still need attention.",
-        )
-
-    return (
-        "weak",
-        "The model needs improvement: inspect the confusion matrix and high-loss examples.",
-    )
+    if test_accuracy >= 0.97 and test_loss <= 0.25:
+        return "good", "The model is strong: high test accuracy and low confidence penalty."
+    if test_accuracy >= 0.93 and test_loss <= 0.5625:
+        return "acceptable", "The model is usable, but confidence or a few classes may still need attention."
+    return "weak", "The model needs improvement: inspect the confusion matrix and high-loss examples."
 
 
 def build_run_config(
+    config: BaselineConfig,
     input_names: list[str],
     shape_names: list[str],
     device: torch.device,
-    model_output_path: Path,
     standardization_mean: np.ndarray,
     standardization_std: np.ndarray,
     verdict: str,
 ) -> dict[str, object]:
-    """Save the parameters needed to reproduce or reload this baseline."""
+    """Collect the parameters needed to reproduce this baseline run."""
     return {
         "experiment": "single_task_conic_baseline",
-        "data_path": str(DATA_PATH),
+        "config_path": str(config.config_path),
+        "data_path": str(config.data.csv_path),
         "device": str(device),
         "input_names": input_names,
         "shape_names": shape_names,
-        "class_to_id": {
-            shape_name: class_id
-            for class_id, shape_name in enumerate(shape_names)
-        },
-        "model_output": str(model_output_path),
+        "class_to_id": {shape_name: class_id for class_id, shape_name in enumerate(shape_names)},
         "model": {
-            "width": [len(input_names), HIDDEN, len(shape_names)],
-            "hidden": HIDDEN,
-            "grid": GRID,
-            "spline_order": SPLINE_ORDER,
-            "seed": SEED,
+            "width": [len(input_names), config.model.hidden, len(shape_names)],
+            "hidden": config.model.hidden,
+            "grid": config.model.grid,
+            "spline_order": config.model.spline_order,
+            "seed": config.split.seed,
         },
-        "training": {
-            "optimizer": OPTIMIZER,
-            "learning_rate": LEARNING_RATE,
-            "min_learning_rate": MIN_LEARNING_RATE,
-            "weight_decay": WEIGHT_DECAY,
-            "steps": STEPS,
-            "label_smoothing": LABEL_SMOOTHING,
-            "loss_function": "CrossEntropyLoss",
-            "early_stopping_monitor": "test_cross_entropy",
-            "early_stopping_patience": EARLY_STOPPING_PATIENCE,
-            "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
-            "restore_best_model": True,
-            "lr_scheduler": "ReduceLROnPlateau",
-            "lr_scheduler_factor": LR_SCHEDULER_FACTOR,
-            "lr_scheduler_patience": LR_SCHEDULER_PATIENCE,
-            "grid_update_every": GRID_UPDATE_EVERY,
-            "stop_grid_update_step": STOP_GRID_UPDATE_STEP,
-            "test_ratio": TEST_RATIO,
-            "standardize": STANDARDIZE,
-        },
+        "training": vars(config.training),
         "standardization": {
+            "enabled": config.standardize,
             "mean": standardization_mean.reshape(-1).astype(float).tolist(),
             "std": standardization_std.reshape(-1).astype(float).tolist(),
         },
         "outputs": {
-            "plot_dir": PLOT_DIR,
-            "metrics_csv": METRICS_OUT,
-            "class_tests_csv": CLASS_TESTS_OUT,
-            "high_loss_csv": HIGH_LOSS_OUT,
-            "run_config_json": RUN_CONFIG_OUT,
-            "final_model": FINAL_MODEL_OUT,
+            "plot_dir": None if config.output.plot_dir is None else str(config.output.plot_dir),
+            "metrics_csv": None if config.output.metrics_path is None else str(config.output.metrics_path),
+            "class_tests_csv": None if config.output.class_tests_path is None else str(config.output.class_tests_path),
+            "high_loss_csv": None if config.output.high_loss_path is None else str(config.output.high_loss_path),
+            "run_config_json": None if config.output.run_config_path is None else str(config.output.run_config_path),
+            "final_model": None if config.output.final_model_path is None else str(config.output.final_model_path),
         },
         "quality_verdict": verdict,
     }
 
 
-def save_run_config(config: dict[str, object], output_path: Path) -> None:
-    """Save the baseline configuration as JSON."""
-    with output_path.open("w", encoding="utf-8") as config_file:
-        json.dump(config, config_file, indent=2)
-        config_file.write("\n")
+def save_final_model(model: KAN, output_path: Path, run_config: dict[str, object]) -> None:
+    """Save model weights and configuration together."""
+    torch.save({"state_dict": model.state_dict(), "run_config": run_config}, output_path)
 
 
-def save_final_model(
-    model: KAN,
-    output_path: Path,
-    run_config: dict[str, object],
-) -> None:
-    """Save model weights and the baseline configuration together."""
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "run_config": run_config,
-        },
-        output_path,
-    )
-
-
-def run_conic_baseline() -> pd.DataFrame:
+def run_baseline(config_path: str | Path = DEFAULT_CONFIG_PATH) -> pd.DataFrame:
     """Train, evaluate, plot, and save the all-classes KAN baseline."""
-    torch.manual_seed(SEED)
-    rng = np.random.default_rng(SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    output_dir = ROOT_DIR / PLOT_DIR
-    clear_output_dir(output_dir)
+    config = load_baseline_config(config_path)
+    torch.manual_seed(config.split.seed)
+    device = detect_device(config.model.device)
+    output_dir = config.output.plot_dir
+    if output_dir is None:
+        raise ValueError("output.plot_dir is required for the baseline experiment.")
+    clear_output_dir(output_dir, config.plots.clear_old_plots)
 
-    input_names = load_feature_names(DATA_PATH)
-    raw_features, labels, shape_names = load_conic_csv(DATA_PATH)
-    train_indices, test_indices, train_by_class, test_by_class = stratified_split(
+    input_names = load_feature_names(config.data.csv_path, config.data.target_column)
+    raw_features, labels, shape_names = load_conic_csv(config.data.csv_path, config.data.target_column)
+    train_indices, test_indices, _, test_by_class = stratified_split(
         labels=labels,
-        test_ratio=TEST_RATIO,
-        seed=SEED,
+        test_ratio=config.split.test_ratio,
+        seed=config.split.seed,
     )
 
-    if STANDARDIZE:
-        standardization_mean, standardization_std = standardization_stats(
-            raw_features,
-            train_indices,
-        )
-        features = ((raw_features - standardization_mean) / standardization_std).astype(
-            np.float32
-        )
+    if config.standardize:
+        standardization_mean, standardization_std = standardization_stats(raw_features, train_indices)
+        features = ((raw_features - standardization_mean) / standardization_std).astype(np.float32)
     else:
         standardization_mean = np.zeros((1, raw_features.shape[1]), dtype=np.float32)
         standardization_std = np.ones((1, raw_features.shape[1]), dtype=np.float32)
         features = raw_features
 
-    dataset = make_kan_dataset(
-        features=features,
-        labels=labels,
-        train_indices=train_indices,
-        test_indices=test_indices,
-        device=device,
-    )
-
-    model = KAN(
-        width=[features.shape[1], HIDDEN, len(shape_names)],
-        grid=GRID,
-        k=SPLINE_ORDER,
-        seed=SEED,
-        auto_save=False,
+    dataset = make_kan_dataset(features, labels, train_indices, test_indices, device)
+    model = build_model(
+        input_dim=features.shape[1],
+        output_dim=len(shape_names),
+        config=config.model,
+        seed=config.split.seed,
         device=device,
     )
 
@@ -442,38 +351,23 @@ def run_conic_baseline() -> pd.DataFrame:
     print(f"Classes: {dict(enumerate(shape_names))}")
     print(f"Training examples: {len(train_indices)}, test examples: {len(test_indices)}")
     print(
-        f"Model: width={[features.shape[1], HIDDEN, len(shape_names)]}, "
-        f"grid={GRID}, k={SPLINE_ORDER}"
+        f"Model: width={[features.shape[1], config.model.hidden, len(shape_names)]}, "
+        f"grid={config.model.grid}, k={config.model.spline_order}"
     )
     print(
-        f"Optimizer: {OPTIMIZER}, lr={LEARNING_RATE}, "
-        f"weight_decay={WEIGHT_DECAY}, label_smoothing={LABEL_SMOOTHING}"
-    )
-    print(
-        f"Early stopping: patience={EARLY_STOPPING_PATIENCE}, "
-        f"min_delta={EARLY_STOPPING_MIN_DELTA}"
+        f"Optimizer: {config.training.optimizer}, lr={config.training.learning_rate}, "
+        f"scheduler={config.training.lr_scheduler}, weight_decay={config.training.weight_decay}, "
+        f"label_smoothing={config.training.label_smoothing}"
     )
 
-    model, results = train_with_early_stopping(model, dataset)
+    model, results = train_with_early_stopping(model, dataset, config)
 
     train_accuracy = accuracy(model, features, labels, train_indices, device)
     test_accuracy = accuracy(model, features, labels, test_indices, device)
     train_cross_entropy = cross_entropy_loss(model, features, labels, train_indices, device)
     test_cross_entropy = cross_entropy_loss(model, features, labels, test_indices, device)
-    final_train_loss = sqrt_cross_entropy_loss(
-        model,
-        features,
-        labels,
-        train_indices,
-        device,
-    )
-    final_test_loss = sqrt_cross_entropy_loss(
-        model,
-        features,
-        labels,
-        test_indices,
-        device,
-    )
+    final_train_loss = cross_entropy_loss(model, features, labels, train_indices, device)
+    final_test_loss = cross_entropy_loss(model, features, labels, test_indices, device)
     verdict, verdict_reason = model_quality_verdict(test_accuracy, final_test_loss)
 
     metrics = pd.DataFrame(
@@ -482,19 +376,20 @@ def run_conic_baseline() -> pd.DataFrame:
                 "model": "single_task_kan",
                 "train_examples": int(len(train_indices)),
                 "test_examples": int(len(test_indices)),
-                "hidden": HIDDEN,
-                "grid": GRID,
-                "spline_order": SPLINE_ORDER,
-                "steps": STEPS,
+                "hidden": config.model.hidden,
+                "grid": config.model.grid,
+                "spline_order": config.model.spline_order,
+                "steps": config.training.steps,
                 "trained_steps": int(results["trained_steps"]),
                 "best_step": int(results["best_step"]),
                 "stopped_early": bool(results["stopped_early"]),
                 "stop_reason": str(results["stop_reason"]),
-                "optimizer": OPTIMIZER,
-                "learning_rate": LEARNING_RATE,
+                "optimizer": config.training.optimizer,
+                "lr_scheduler": config.training.lr_scheduler,
+                "learning_rate": config.training.learning_rate,
                 "final_learning_rate": float(results["final_learning_rate"]),
-                "weight_decay": WEIGHT_DECAY,
-                "label_smoothing": LABEL_SMOOTHING,
+                "weight_decay": config.training.weight_decay,
+                "label_smoothing": config.training.label_smoothing,
                 "train_accuracy": train_accuracy,
                 "test_accuracy": test_accuracy,
                 "train_cross_entropy": train_cross_entropy,
@@ -509,8 +404,9 @@ def run_conic_baseline() -> pd.DataFrame:
             }
         ]
     )
-    metrics_path = ROOT_DIR / METRICS_OUT
-    metrics.to_csv(metrics_path, index=False)
+
+    if config.output.metrics_path is not None:
+        metrics.to_csv(config.output.metrics_path, index=False)
 
     class_rows = []
     for class_id, class_name in enumerate(shape_names):
@@ -519,26 +415,14 @@ def run_conic_baseline() -> pd.DataFrame:
             {
                 "test_class": class_name,
                 "test_examples": int(len(class_indices)),
-                "test_loss": sqrt_cross_entropy_loss(
-                    model,
-                    features,
-                    labels,
-                    class_indices,
-                    device,
-                ),
-                "test_accuracy": accuracy(
-                    model,
-                    features,
-                    labels,
-                    class_indices,
-                    device,
-                ),
+                "test_loss": cross_entropy_loss(model, features, labels, class_indices, device),
+                "test_accuracy": accuracy(model, features, labels, class_indices, device),
             }
         )
 
     class_tests = pd.DataFrame(class_rows)
-    class_tests_path = ROOT_DIR / CLASS_TESTS_OUT
-    class_tests.to_csv(class_tests_path, index=False)
+    if config.output.class_tests_path is not None:
+        class_tests.to_csv(config.output.class_tests_path, index=False)
 
     loss_history = [
         {
@@ -579,8 +463,8 @@ def run_conic_baseline() -> pd.DataFrame:
         shape_names=shape_names,
         device=device,
         output_file=output_dir / "03_prediction_examples.png",
-        examples_per_class=PLOT_EXAMPLES,
-        seed=SEED,
+        examples_per_class=config.plots.prediction_examples,
+        seed=config.split.seed,
         title="Single-task KAN predictions",
     )
 
@@ -591,15 +475,11 @@ def run_conic_baseline() -> pd.DataFrame:
         indices=test_indices,
         shape_names=shape_names,
         device=device,
-        n_examples=HIGH_LOSS_EXAMPLES,
+        n_examples=config.plots.high_loss_examples,
     )
-    high_loss_path = ROOT_DIR / HIGH_LOSS_OUT
-    high_loss_frame.to_csv(high_loss_path, index=False)
-    plot_high_loss_examples(
-        high_loss_frame,
-        raw_features,
-        output_dir / "04_high_loss_examples.png",
-    )
+    if config.output.high_loss_path is not None:
+        high_loss_frame.to_csv(config.output.high_loss_path, index=False)
+    plot_high_loss_examples(high_loss_frame, raw_features, output_dir / "04_high_loss_examples.png")
 
     edge_image_path, edge_table_path = plot_kan_edge_functions(
         model=model,
@@ -612,20 +492,20 @@ def run_conic_baseline() -> pd.DataFrame:
         title="Single-task KAN edge functions",
     )
 
-    run_config_path = ROOT_DIR / RUN_CONFIG_OUT
-    final_model_path = ROOT_DIR / FINAL_MODEL_OUT
     run_config = build_run_config(
+        config=config,
         input_names=input_names,
         shape_names=shape_names,
         device=device,
-        model_output_path=final_model_path,
         standardization_mean=standardization_mean,
         standardization_std=standardization_std,
         verdict=verdict,
     )
     run_config["final_results"] = metrics.iloc[0].to_dict()
-    save_final_model(model, final_model_path, run_config)
-    save_run_config(run_config, run_config_path)
+    if config.output.final_model_path is not None:
+        save_final_model(model, config.output.final_model_path, run_config)
+    if config.output.run_config_path is not None:
+        write_json(config.output.run_config_path, run_config)
 
     print()
     print("Single-task baseline results:")
@@ -637,24 +517,36 @@ def run_conic_baseline() -> pd.DataFrame:
         f"stopped early: {bool(results['stopped_early'])}"
     )
     print(f"Verdict: {verdict.upper()} - {verdict_reason}")
-    print(f"Metrics saved to: {metrics_path}")
-    print(f"Class tests saved to: {class_tests_path}")
+    if config.output.metrics_path is not None:
+        print(f"Metrics saved to: {config.output.metrics_path}")
+    if config.output.class_tests_path is not None:
+        print(f"Class tests saved to: {config.output.class_tests_path}")
     print(f"Confusion matrix saved to: {confusion_image}")
     print(f"Confusion matrix CSV saved to: {confusion_csv}")
-    print(f"High-loss examples saved to: {high_loss_path}")
+    if config.output.high_loss_path is not None:
+        print(f"High-loss examples saved to: {config.output.high_loss_path}")
     print(f"Final edge-function plot saved to: {edge_image_path}")
     print(f"Final edge-function table saved to: {edge_table_path}")
-    print(f"Final model checkpoint saved to: {final_model_path}")
-    print(f"Run configuration saved to: {run_config_path}")
+    if config.output.final_model_path is not None:
+        print(f"Final model checkpoint saved to: {config.output.final_model_path}")
+    if config.output.run_config_path is not None:
+        print(f"Run configuration saved to: {config.output.run_config_path}")
     print(f"Plots saved in: {output_dir}")
 
     return metrics
 
 
-if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        raise SystemExit(
-            "This script does not accept command-line arguments: edit the CONFIG block."
-        )
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Train the single-task conic KAN baseline.")
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"Path to the TOML config file. Default: {DEFAULT_CONFIG_PATH}",
+    )
+    args = parser.parse_args(argv)
+    run_baseline(args.config)
+    return 0
 
-    run_conic_baseline()
+
+if __name__ == "__main__":
+    raise SystemExit(main())

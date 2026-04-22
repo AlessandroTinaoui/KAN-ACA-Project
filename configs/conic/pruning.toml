@@ -1,0 +1,35 @@
+[data]
+csv_path = "../../dataset/Conic-Section_dataset.csv"
+target_column = "shape"
+
+[split]
+test_ratio = 0.2
+seed = 1
+
+[model]
+hidden = 4
+grid = 3
+spline_order = 3
+auto_save = false
+device = "auto"
+
+[training]
+optimizer = "LBFGS"
+learning_rate = 0.5
+standardize = true
+probe_hidden = 24
+probe_steps = 8
+start_hidden = 4
+keep_hidden_schedule = [4, 6, 8, 12, 16]
+train_steps_per_model = 15
+
+[plots]
+clear_old_plots = true
+prediction_examples = 2
+high_loss_examples = 12
+plot_edge_functions = true
+
+[output]
+metrics_path = "../../pruning_metrics.csv"
+high_loss_path = "../../high_loss_examples.csv"
+plot_dir = "../../pruning_plots"

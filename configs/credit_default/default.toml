@@ -1,5 +1,5 @@
 [data]
-csv_path = "../dataset/default of credit card clients.csv"
+csv_path = "../../dataset/default of credit card clients.csv"
 target_column = "default payment next month"
 header_row = 1
 separator = ","
@@ -49,7 +49,7 @@ steps = 181
 default = 0.50
 
 [output]
-output_dir = "../artifacts/credit_default_kan"
+output_dir = "../../artifacts/credit_default_kan"
 model_filename = "model.pt"
 preprocessor_filename = "preprocessor.pkl"
 metrics_filename = "metrics.json"

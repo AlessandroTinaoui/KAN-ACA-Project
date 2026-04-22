@@ -1,5 +1,5 @@
 [data]
-csv_path = "../dataset/healthcare-dataset-stroke-data.csv"
+csv_path = "../../dataset/healthcare-dataset-stroke-data.csv"
 target_column = "stroke"
 header_row = 0
 separator = ","
@@ -61,7 +61,7 @@ keep_hidden_schedule = [4, 6, 8, 12, 16]
 epochs_per_model = 40
 
 [output]
-output_dir = "../artifacts/stroke_pruning_kan"
+output_dir = "../../artifacts/stroke_pruning_kan"
 model_filename = "model.pt"
 preprocessor_filename = "preprocessor.pkl"
 metrics_filename = "metrics.json"

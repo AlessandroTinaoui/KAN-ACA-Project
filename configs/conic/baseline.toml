@@ -1,0 +1,44 @@
+[data]
+csv_path = "../../dataset/Conic-Section_dataset.csv"
+target_column = "shape"
+
+[split]
+test_ratio = 0.2
+seed = 1
+
+[model]
+hidden = 6
+grid = 3
+spline_order = 3
+auto_save = false
+device = "auto"
+
+[training]
+optimizer = "Adam"
+learning_rate = 0.01
+min_learning_rate = 1e-4
+weight_decay = 0
+steps = 2500
+label_smoothing = 0.02
+early_stopping_patience = 200
+early_stopping_min_delta = 0.0001
+lr_scheduler_factor = 0.5
+lr_scheduler_patience = 3
+lr_scheduler = "CosineAnnealingLR"
+grid_update_every = 10
+stop_grid_update_step = 100
+
+standardize = true
+
+[plots]
+clear_old_plots = true
+prediction_examples = 2
+high_loss_examples = 12
+
+[output]
+metrics_path = "../../conic_metrics.csv"
+class_tests_path = "../../conic_class_tests.csv"
+high_loss_path = "../../conic_high_loss_examples.csv"
+run_config_path = "../../conic_run_config.json"
+final_model_path = "../../conic_model_final.pt"
+plot_dir = "../../conic_plots"

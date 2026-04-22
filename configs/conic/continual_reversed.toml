@@ -1,0 +1,82 @@
+[data]
+csv_path = "../../dataset/Conic-Section_dataset.csv"
+target_column = "shape"
+
+[split]
+test_ratio = 0.2
+seed = 1
+
+[model]
+hidden = 8
+grid = 3
+spline_order = 3
+auto_save = false
+device = "auto"
+
+[training]
+epochs_per_task = [60, 80, 100, 100]
+batch_size = 256
+optimizer = "Adam"
+learning_rate = 0.01
+min_learning_rate = 0.0001
+mask_future_classes = true
+label_smoothing = 0.05
+use_balanced_sampler = true
+use_lwf = true
+initial_lambda_kd = 0.5
+lambda_kd_decay = 0.8
+distillation_temperature = 2.0
+freeze_grid_after_first = false
+
+[early_stopping]
+enabled = true
+check_every = 5
+patience = 2
+min_delta = 0.0001
+anti_forgetting_enabled = true
+anti_forgetting_tolerance = 0.02
+anti_forgetting_patience = 5
+
+[grid]
+update_every = 10
+stop_update_epoch = 50
+
+standardize = true
+
+[plots]
+prediction_examples = 2
+enable_predictions = true
+enable_loss = true
+enable_error = true
+enable_class_tests = true
+enable_confusion_matrices = true
+enable_edge_functions = true
+
+[[schedule]]
+circle = 800
+hyperbola = 800
+
+[[schedule]]
+circle = 300
+hyperbola = 300
+ellipse = 800
+
+[[schedule]]
+circle = 200
+hyperbola = 200
+ellipse = 200
+parabola = 800
+
+[[schedule]]
+circle = 200
+hyperbola = 200
+ellipse = 200
+parabola = 200
+
+[output]
+metrics_path = "../../continual_metrics_reversed.csv"
+class_tests_path = "../../continual_class_tests_reversed.csv"
+accuracy_config_path = "../../continual_accuracy_config_reversed.json"
+run_config_path = "../../continual_run_config_reversed.json"
+final_model_path = "../../continual_model_final_reversed.pt"
+plot_dir = "../../continual_plots_reversed"
