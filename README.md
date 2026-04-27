@@ -75,6 +75,9 @@ If you already have a working `.venv`, activate it before running the experiment
 |           |       |-- main.py
 |           |       |-- plotting.py
 |           |       `-- training.py
+|           |-- sine_1d/
+|           |   |-- main.py
+|           |   `-- params.toml
 |           |-- credit_default/
 |           `-- stroke/
 |
@@ -210,4 +213,33 @@ Main outputs:
 pruning_metrics.csv
 high_loss_examples.csv
 pruning_plots/
+```
+
+### 5. Mini 1D KAN for RISC-V Export
+
+This trains a minimal `[1, 1]` KAN for:
+
+```text
+f(x) = sin(2*pi*x) + 0.35*sin(10*pi*x)
+```
+
+All editable parameters are stored in the local parameter file:
+
+```text
+src/kan_models/models/sine_1d/params.toml
+```
+
+Run:
+
+```powershell
+python src/kan_models/models/sine_1d/main.py
+```
+
+Main outputs:
+
+```text
+artifacts/sine_1d/mini_kan_riscv_export.json
+artifacts/sine_1d/mini_kan_metrics.json
+artifacts/sine_1d/mini_kan_checkpoint.pt
+artifacts/sine_1d/mini_kan_fit.png
 ```
