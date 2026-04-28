@@ -10,8 +10,7 @@ amplitude = 0.35
 frequency = 5.0
 
 [model]
-input_dim = 1
-output_dim = 1
+width = [1, 4, 1]
 degree = 3
 num_control_points = 15
 num_knots = 19
