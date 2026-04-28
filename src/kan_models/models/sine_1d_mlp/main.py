@@ -1,4 +1,4 @@
-"""Train and export a minimal 1D KAN from a local TOML parameter file."""
+"""Train and export a small MLP for the 1D sine regression task."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from kan import KAN
+from torch import nn
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -28,7 +28,7 @@ DEFAULT_PARAMS_PATH = Path(__file__).resolve().with_name("params.toml")
 
 @dataclass(frozen=True)
 class SineTerm:
-    """amplitude * sin(2*pi*frequency*x)."""
+    """amplitude * sin(2*pi*frequency*x)"""
 
     amplitude: float
     frequency: float
@@ -36,7 +36,7 @@ class SineTerm:
 
 @dataclass(frozen=True)
 class FunctionConfig:
-    """Target function."""
+    """Target function"""
 
     name: str
     terms: list[SineTerm]
@@ -44,23 +44,19 @@ class FunctionConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Config for exporting parameters."""
+    """MLP architecture"""
 
     input_dim: int
     output_dim: int
-    degree: int
-    num_control_points: int
-    num_knots: int
+    hidden_layers: list[int]
+    activation: str
     x_min: float
     x_max: float
-    noise_scale: float
-    disable_base_branch: bool
-    scale_sp: float
 
     @property
-    def num_intervals(self) -> int:
-        """pykan grid intervals implied by control points and spline degree."""
-        return self.num_control_points - self.degree
+    def architecture(self) -> list[int]:
+        """List of layer sizes"""
+        return [self.input_dim, *self.hidden_layers, self.output_dim]
 
 
 @dataclass(frozen=True)
@@ -80,6 +76,7 @@ class TrainingConfig:
     steps: int
     learning_rate: float
     min_learning_rate: float
+    weight_decay: float
     early_stopping_patience: int
     early_stopping_min_delta: float
 
@@ -101,18 +98,19 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class OutputConfig:
-    """Resolved output paths."""
+    """Output paths."""
 
     output_dir: Path
     export_json: Path
     metrics_json: Path
     checkpoint_pt: Path
     fit_plot: Path
+    loss_plot: Path
 
 
 @dataclass(frozen=True)
-class Sine1DConfig:
-    """Full local configuration"""
+class MlpSine1DConfig:
+    """Full local configuration."""
 
     config_path: Path
     function: FunctionConfig
@@ -124,11 +122,42 @@ class Sine1DConfig:
     output: OutputConfig
 
 
+class SineMLP(nn.Module):
+    def __init__(self, layer_sizes: list[int], activation: str) -> None:
+        super().__init__()
+        if len(layer_sizes) < 2:
+            raise ValueError("The MLP needs at least an input and an output layer.")
+
+        activation_module = make_activation(activation)
+        layers: list[nn.Module] = []
+        for layer_index, (in_features, out_features) in enumerate(
+            zip(layer_sizes[:-1], layer_sizes[1:])
+        ):
+            layers.append(nn.Linear(in_features, out_features))
+            if layer_index < len(layer_sizes) - 2:
+                layers.append(activation_module())
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
+def make_activation(name: str) -> type[nn.Module]:
+    """Return the activation class used between hidden layers."""
+    normalized = name.strip().lower()
+    if normalized == "tanh":
+        return nn.Tanh
+    if normalized == "relu":
+        return nn.ReLU
+    if normalized == "silu":
+        return nn.SiLU
+    raise ValueError(f"Unsupported activation '{name}'. Use tanh, relu, or silu.")
+
+
 def _required_section(raw: dict[str, Any], name: str) -> dict[str, Any]:
-    """Parsing TOML"""
     section = raw.get(name)
     if not isinstance(section, dict):
-        raise ValueError(f"Missing [{name}] section in the sine_1d parameter file.")
+        raise ValueError(f"Missing [{name}] section in the sine_1d_mlp parameter file.")
     return section
 
 
@@ -150,28 +179,24 @@ def _load_output_config(config_dir: Path, section: dict[str, Any]) -> OutputConf
         metrics_json=output_dir / str(section["metrics_json"]),
         checkpoint_pt=output_dir / str(section["checkpoint_pt"]),
         fit_plot=output_dir / str(section["fit_plot"]),
+        loss_plot=output_dir / str(section["loss_plot"]),
     )
 
 
-def validate_config(config: Sine1DConfig) -> None:
-    """Check that the exported spline dimensions match the requested layout."""
+def validate_config(config: MlpSine1DConfig) -> None:
     model = config.model
     if model.input_dim != 1 or model.output_dim != 1:
-        raise ValueError("The RISC-V mini KAN export expects input_dim=1 and output_dim=1.")
-    if model.num_intervals <= 0:
-        raise ValueError("num_control_points must be larger than degree.")
-    expected_knots = model.num_intervals + 1 + 2 * model.degree
-    if expected_knots != model.num_knots:
-        raise ValueError(
-            "Invalid spline layout: "
-            f"num_knots should be {expected_knots}, got {model.num_knots}."
-        )
+        raise ValueError("The RISC-V MLP export expects input_dim=1 and output_dim=1.")
+    if not model.hidden_layers:
+        raise ValueError("Use at least one hidden layer for this baseline.")
+    if any(width <= 0 for width in model.hidden_layers):
+        raise ValueError("All hidden layer sizes must be positive.")
     if model.x_min >= model.x_max:
         raise ValueError("x_min must be smaller than x_max.")
 
 
-def load_params(path: str | Path = DEFAULT_PARAMS_PATH) -> Sine1DConfig:
-    """Load every modifiable parameter from the local TOML file."""
+def load_params(path: str | Path = DEFAULT_PARAMS_PATH) -> MlpSine1DConfig:
+    """Load every parameter from the TOML file."""
     config_path, raw = load_toml(path)
     config_dir = config_path.parent
 
@@ -183,7 +208,7 @@ def load_params(path: str | Path = DEFAULT_PARAMS_PATH) -> Sine1DConfig:
     runtime = RuntimeConfig(**_required_section(raw, "runtime"))
     output = _load_output_config(config_dir, _required_section(raw, "output"))
 
-    config = Sine1DConfig(
+    config = MlpSine1DConfig(
         config_path=config_path,
         function=function,
         model=model,
@@ -205,8 +230,8 @@ def target_function(x: torch.Tensor, config: FunctionConfig) -> torch.Tensor:
     return y
 
 
-def make_dataset(config: Sine1DConfig, device: torch.device) -> dict[str, torch.Tensor]:
-    """Build simple train/validation/test splits in [x_min, x_max]."""
+def make_dataset(config: MlpSine1DConfig, device: torch.device) -> dict[str, torch.Tensor]:
+    """Build simple train/validation/test in [x_min, x_max]."""
     generator = torch.Generator(device="cpu")
     generator.manual_seed(config.data.seed)
 
@@ -218,48 +243,30 @@ def make_dataset(config: Sine1DConfig, device: torch.device) -> dict[str, torch.
     train_x = x_min + (x_max - x_min) * train_x
     validation_x = x_min + (x_max - x_min) * validation_x
     test_x = x_min + (x_max - x_min) * test_x
-    train_y = target_function(train_x, config.function)
-    validation_y = target_function(validation_x, config.function)
-    test_y = target_function(test_x, config.function)
 
     return {
         "train_input": train_x.to(device),
-        "train_label": train_y.to(device),
+        "train_label": target_function(train_x, config.function).to(device),
         "validation_input": validation_x.to(device),
-        "validation_label": validation_y.to(device),
+        "validation_label": target_function(validation_x, config.function).to(device),
         "test_input": test_x.to(device),
-        "test_label": test_y.to(device),
+        "test_label": target_function(test_x, config.function).to(device),
     }
 
 
-def build_model(config: Sine1DConfig, device: torch.device) -> KAN:
-    """Build the smallest useful KAN: one input edge and one output edge."""
-    model_config = config.model
-    model = KAN(
-        width=[model_config.input_dim, model_config.output_dim],
-        grid=model_config.num_intervals,
-        k=model_config.degree,
-        grid_range=[model_config.x_min, model_config.x_max],
-        noise_scale=model_config.noise_scale,
-        seed=config.data.seed,
-        auto_save=False,
-        device=device,
-    )
-
-    layer = model.act_fun[0]
-    if model_config.disable_base_branch:
-        # This makes the exported model depend only on knots + control points.
-        layer.scale_base.data.zero_()
-        layer.scale_base.requires_grad_(False)
-    layer.scale_sp.data.fill_(model_config.scale_sp)
-    layer.scale_sp.requires_grad_(False)
-    layer.mask.data.fill_(1.0)
-
+def build_model(config: MlpSine1DConfig, device: torch.device) -> SineMLP:
+    """Build and initialize the MLP."""
+    torch.manual_seed(config.data.seed)
+    model = SineMLP(config.model.architecture, config.model.activation).to(device)
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.zeros_(module.bias)
     return model
 
 
 @torch.no_grad()
-def mse_loss(model: KAN, x: torch.Tensor, y: torch.Tensor) -> float:
+def mse_loss(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> float:
     """Return mean squared error."""
     model.eval()
     prediction = model(x)
@@ -267,7 +274,7 @@ def mse_loss(model: KAN, x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def mae_loss(model: KAN, x: torch.Tensor, y: torch.Tensor) -> float:
+def mae_loss(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> float:
     """Return mean absolute error."""
     model.eval()
     prediction = model(x)
@@ -275,16 +282,15 @@ def mae_loss(model: KAN, x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def tolerance_accuracy(model: KAN, x: torch.Tensor, y: torch.Tensor, tolerance: float) -> float:
-    """Regression accuracy defined as fraction of samples under an absolute-error threshold."""
+def tolerance_accuracy(model: nn.Module, x: torch.Tensor, y: torch.Tensor, tolerance: float) -> float:
     model.eval()
     prediction = model(x)
     return float((prediction.sub(y).abs() <= tolerance).float().mean().cpu())
 
 
 @torch.no_grad()
-def r2_score(model: KAN, x: torch.Tensor, y: torch.Tensor) -> float:
-    """Compute R^2 for regression sanity-checking."""
+def r2_score(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> float:
+    """Compute R^2."""
     model.eval()
     prediction = model(x)
     residual = torch.sum((y - prediction) ** 2)
@@ -293,13 +299,17 @@ def r2_score(model: KAN, x: torch.Tensor, y: torch.Tensor) -> float:
 
 
 def train_model(
-    model: KAN,
+    model: nn.Module,
     dataset: dict[str, torch.Tensor],
-    config: Sine1DConfig,
-) -> tuple[KAN, dict[str, list[float] | float | int | bool | str]]:
-    """Train the mini KAN with a simple full-batch loop."""
+    config: MlpSine1DConfig,
+) -> tuple[nn.Module, dict[str, list[float] | float | int | bool | str]]:
+    """Train the MLP."""
     training = config.training
-    optimizer = torch.optim.Adam(model.get_params(), lr=training.learning_rate)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=training.learning_rate,
+        weight_decay=training.weight_decay,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=training.steps,
@@ -368,44 +378,60 @@ def train_model(
     return model, history
 
 
-def extract_export_payload(model: KAN, config: Sine1DConfig) -> dict[str, object]:
-    """Extract the parameters."""
-    model_config = config.model
-    layer = model.act_fun[0]
-    knots = layer.grid.detach().cpu().reshape(-1).tolist()
-    control_points = layer.coef.detach().cpu().reshape(-1).tolist()
-
-    if len(knots) != model_config.num_knots:
-        raise ValueError(f"Expected {model_config.num_knots} knots, found {len(knots)}.")
-    if len(control_points) != model_config.num_control_points:
-        raise ValueError(
-            f"Expected {model_config.num_control_points} control points, found {len(control_points)}."
+def extract_linear_layers(model: SineMLP) -> list[dict[str, object]]:
+    """Export every layer for inference."""
+    exported_layers: list[dict[str, object]] = []
+    linear_index = 0
+    for module in model.network:
+        if not isinstance(module, nn.Linear):
+            continue
+        weight = module.weight.detach().cpu()
+        bias = module.bias.detach().cpu()
+        exported_layers.append(
+            {
+                "name": f"linear_{linear_index}",
+                "in_features": int(module.in_features),
+                "out_features": int(module.out_features),
+                "weight_layout": "out_features x in_features",
+                "weights": [[float(value) for value in row] for row in weight.tolist()],
+                "bias": [float(value) for value in bias.tolist()],
+            }
         )
+        linear_index += 1
+    return exported_layers
 
+
+def extract_export_payload(
+    model: SineMLP,
+    config: MlpSine1DConfig,
+    metrics: dict[str, object],
+) -> dict[str, object]:
+    """Extract the exact parameters needed for inference"""
+    model_config = config.model
     return {
-        "model_type": "mini_kan_spline_only",
+        "model_type": "sine_1d_mlp",
         "config_path": str(config.config_path),
         "function": config.function.name,
         "function_terms": [vars(term) for term in config.function.terms],
         "input_dim": model_config.input_dim,
         "output_dim": model_config.output_dim,
-        "degree": model_config.degree,
-        "num_control_points": model_config.num_control_points,
-        "num_knots": model_config.num_knots,
-        "num_intervals": model_config.num_intervals,
+        "architecture": model_config.architecture,
+        "hidden_layers": model_config.hidden_layers,
+        "activation": model_config.activation,
+        "activation_applied_after": "all hidden linear layers",
+        "output_activation": "linear",
         "x_min": model_config.x_min,
         "x_max": model_config.x_max,
-        "knots": [float(value) for value in knots],
-        "control_points": [float(value) for value in control_points],
-        "base_branch_disabled": model_config.disable_base_branch,
-        "scale_base": 0.0 if model_config.disable_base_branch else float(layer.scale_base.detach().cpu().reshape(-1)[0]),
-        "scale_sp": float(layer.scale_sp.detach().cpu().reshape(-1)[0]),
+        "data_config": vars(config.data),
+        "training_config": vars(config.training),
+        "layers": extract_linear_layers(model),
+        "metrics": metrics,
     }
 
 
 @torch.no_grad()
-def save_fit_plot(model: KAN, output_file: Path, device: torch.device, config: Sine1DConfig) -> None:
-    """Save a simple comparison plot between the target function and the fitted KAN."""
+def save_fit_plot(model: nn.Module, output_file: Path, device: torch.device, config: MlpSine1DConfig) -> None:
+    """Save a comparison plot between the target function and the fitted MLP."""
     model_config = config.model
     x_plot = torch.linspace(
         model_config.x_min,
@@ -418,8 +444,8 @@ def save_fit_plot(model: KAN, output_file: Path, device: torch.device, config: S
 
     fig, ax = plt.subplots(figsize=(9, 4.8), constrained_layout=True)
     ax.plot(x_plot.cpu().numpy().reshape(-1), y_true, label="target", linewidth=2)
-    ax.plot(x_plot.cpu().numpy().reshape(-1), y_pred, label="mini KAN", linewidth=2, linestyle="--")
-    ax.set_title("Mini KAN fit on the 1D sinusoidal target")
+    ax.plot(x_plot.cpu().numpy().reshape(-1), y_pred, label="MLP", linewidth=2, linestyle="--")
+    ax.set_title("MLP fit on the 1D sinusoidal target")
     ax.set_xlabel("x")
     ax.set_ylabel("f(x)")
     ax.grid(True, linewidth=0.4, alpha=0.35)
@@ -428,8 +454,26 @@ def save_fit_plot(model: KAN, output_file: Path, device: torch.device, config: S
     plt.close(fig)
 
 
+def save_loss_plot(history: dict[str, list[float] | float | int | bool | str], output_file: Path) -> None:
+    """Save the train/validation MSE plots."""
+    train_mse = history["train_mse"]
+    validation_mse = history["validation_mse"]
+    steps = list(range(1, len(train_mse) + 1))
+
+    fig, ax = plt.subplots(figsize=(9, 4.8), constrained_layout=True)
+    ax.plot(steps, train_mse, label="train MSE", linewidth=2)
+    ax.plot(steps, validation_mse, label="validation MSE", linewidth=2)
+    ax.set_title("MLP training history")
+    ax.set_xlabel("step")
+    ax.set_ylabel("MSE")
+    ax.grid(True, linewidth=0.4, alpha=0.35)
+    ax.legend()
+    fig.savefig(output_file, dpi=180)
+    plt.close(fig)
+
+
 def run(params_path: str | Path = DEFAULT_PARAMS_PATH) -> dict[str, object]:
-    """Train, validate, export, and save the mini KAN."""
+    """Run the MLP NN."""
     config = load_params(params_path)
     ensure_directory(config.output.output_dir)
     device = detect_device(config.runtime.device)
@@ -445,7 +489,7 @@ def run(params_path: str | Path = DEFAULT_PARAMS_PATH) -> dict[str, object]:
     test_y = dataset["test_label"]
     tolerance = config.evaluation.accuracy_tolerance
 
-    metrics = {
+    metrics: dict[str, object] = {
         "config_path": str(config.config_path),
         "device": str(device),
         "train_mse": mse_loss(model, train_x, train_y),
@@ -468,16 +512,17 @@ def run(params_path: str | Path = DEFAULT_PARAMS_PATH) -> dict[str, object]:
         "stop_reason": str(history["stop_reason"]),
     }
 
-    export_payload = extract_export_payload(model, config)
-    export_payload["metrics"] = metrics
+    export_payload = extract_export_payload(model, config, metrics)
     write_json(config.output.export_json, export_payload)
     write_json(config.output.metrics_json, metrics)
     torch.save({"state_dict": model.state_dict(), "export": export_payload}, config.output.checkpoint_pt)
     save_fit_plot(model, config.output.fit_plot, device, config)
+    save_loss_plot(history, config.output.loss_plot)
 
     print(f"Config: {config.config_path}")
     print(f"Device: {device}")
-    print("Mini KAN [1,1] trained for sinusoidal regression")
+    print("MLP trained for 1D sinusoidal regression")
+    print(f"Architecture: {config.model.architecture}, activation={config.model.activation}")
     print(f"Train MSE: {metrics['train_mse']:.8f}")
     print(f"Validation MSE: {metrics['validation_mse']:.8f}")
     print(f"Test MSE: {metrics['test_mse']:.8f}")
@@ -492,13 +537,14 @@ def run(params_path: str | Path = DEFAULT_PARAMS_PATH) -> dict[str, object]:
     print(f"Metrics JSON saved to: {config.output.metrics_json}")
     print(f"Checkpoint saved to: {config.output.checkpoint_pt}")
     print(f"Fit plot saved to: {config.output.fit_plot}")
+    print(f"Loss plot saved to: {config.output.loss_plot}")
 
     return export_payload
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint."""
-    parser = argparse.ArgumentParser(description="Train and export the sine_1d mini KAN.")
+    parser = argparse.ArgumentParser(description="Train and export the sine_1d MLP baseline.")
     parser.add_argument(
         "--params",
         default=str(DEFAULT_PARAMS_PATH),
