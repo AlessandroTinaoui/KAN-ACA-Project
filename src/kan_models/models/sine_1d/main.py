@@ -14,6 +14,7 @@ from kan import KAN
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from kan_models.common.runtime import configure_matplotlib, detect_device, ensure_directory
 from kan_models.common.shared import clone_state_dict, load_toml, resolve_path, write_json
@@ -46,8 +47,7 @@ class FunctionConfig:
 class ModelConfig:
     """Config for exporting parameters."""
 
-    input_dim: int
-    output_dim: int
+    width: list[int]
     degree: int
     num_control_points: int
     num_knots: int
@@ -61,6 +61,16 @@ class ModelConfig:
     def num_intervals(self) -> int:
         """pykan grid intervals implied by control points and spline degree."""
         return self.num_control_points - self.degree
+
+    @property
+    def input_dim(self) -> int:
+        """Input width."""
+        return self.width[0]
+
+    @property
+    def output_dim(self) -> int:
+        """Output width."""
+        return self.width[-1]
 
 
 @dataclass(frozen=True)
@@ -156,8 +166,12 @@ def _load_output_config(config_dir: Path, section: dict[str, Any]) -> OutputConf
 def validate_config(config: Sine1DConfig) -> None:
     """Check that the exported spline dimensions match the requested layout."""
     model = config.model
+    if len(model.width) < 2:
+        raise ValueError("width must contain at least input and output dimensions.")
+    if any(int(layer_width) <= 0 for layer_width in model.width):
+        raise ValueError("Every entry in width must be a positive integer.")
     if model.input_dim != 1 or model.output_dim != 1:
-        raise ValueError("The RISC-V mini KAN export expects input_dim=1 and output_dim=1.")
+        raise ValueError("The sine_1d export expects width to start with 1 and end with 1.")
     if model.num_intervals <= 0:
         raise ValueError("num_control_points must be larger than degree.")
     expected_knots = model.num_intervals + 1 + 2 * model.degree
@@ -233,10 +247,10 @@ def make_dataset(config: Sine1DConfig, device: torch.device) -> dict[str, torch.
 
 
 def build_model(config: Sine1DConfig, device: torch.device) -> KAN:
-    """Build the smallest useful KAN: one input edge and one output edge."""
+    """Build the configured KAN width for 1D sinusoidal regression."""
     model_config = config.model
     model = KAN(
-        width=[model_config.input_dim, model_config.output_dim],
+        width=list(model_config.width),
         grid=model_config.num_intervals,
         k=model_config.degree,
         grid_range=[model_config.x_min, model_config.x_max],
@@ -246,14 +260,14 @@ def build_model(config: Sine1DConfig, device: torch.device) -> KAN:
         device=device,
     )
 
-    layer = model.act_fun[0]
-    if model_config.disable_base_branch:
-        # This makes the exported model depend only on knots + control points.
-        layer.scale_base.data.zero_()
-        layer.scale_base.requires_grad_(False)
-    layer.scale_sp.data.fill_(model_config.scale_sp)
-    layer.scale_sp.requires_grad_(False)
-    layer.mask.data.fill_(1.0)
+    for layer in model.act_fun:
+        if model_config.disable_base_branch:
+            # This makes the exported model depend only on knots + control points.
+            layer.scale_base.data.zero_()
+            layer.scale_base.requires_grad_(False)
+        layer.scale_sp.data.fill_(model_config.scale_sp)
+        layer.scale_sp.requires_grad_(False)
+        layer.mask.data.fill_(1.0)
 
     return model
 
@@ -370,23 +384,57 @@ def train_model(
 
 def extract_export_payload(model: KAN, config: Sine1DConfig) -> dict[str, object]:
     """Extract the parameters."""
+    """Extract the trained spline stack for lightweight inference."""
     model_config = config.model
-    layer = model.act_fun[0]
-    knots = layer.grid.detach().cpu().reshape(-1).tolist()
-    control_points = layer.coef.detach().cpu().reshape(-1).tolist()
+    layers_payload: list[dict[str, object]] = []
 
-    if len(knots) != model_config.num_knots:
-        raise ValueError(f"Expected {model_config.num_knots} knots, found {len(knots)}.")
-    if len(control_points) != model_config.num_control_points:
-        raise ValueError(
-            f"Expected {model_config.num_control_points} control points, found {len(control_points)}."
+    for index, layer in enumerate(model.act_fun):
+        knots = layer.grid.detach().cpu().tolist()
+        control_points = layer.coef.detach().cpu().tolist()
+
+        for knot_row in knots:
+            if len(knot_row) != model_config.num_knots:
+                raise ValueError(f"Expected {model_config.num_knots} knots per edge, found {len(knot_row)}.")
+        for source_edges in control_points:
+            for edge_control_points in source_edges:
+                if len(edge_control_points) != model_config.num_control_points:
+                    raise ValueError(
+                        "Expected "
+                        f"{model_config.num_control_points} control points per edge, found "
+                        f"{len(edge_control_points)}."
+                    )
+
+        layers_payload.append(
+            {
+                "layer_index": index,
+                "input_dim": model_config.width[index],
+                "output_dim": model_config.width[index + 1],
+                "knots": [[float(value) for value in knot_row] for knot_row in knots],
+                "control_points": [
+                    [[float(value) for value in edge_control_points] for edge_control_points in source_edges]
+                    for source_edges in control_points
+                ],
+                "scale_base": [
+                    [float(value) for value in row]
+                    for row in layer.scale_base.detach().cpu().tolist()
+                ],
+                "scale_sp": [
+                    [float(value) for value in row]
+                    for row in layer.scale_sp.detach().cpu().tolist()
+                ],
+                "mask": [
+                    [float(value) for value in row]
+                    for row in layer.mask.detach().cpu().tolist()
+                ],
+            }
         )
 
-    return {
-        "model_type": "mini_kan_spline_only",
+    payload = {
+        "model_type": "kan_spline_stack",
         "config_path": str(config.config_path),
         "function": config.function.name,
         "function_terms": [vars(term) for term in config.function.terms],
+        "width": model_config.width,
         "input_dim": model_config.input_dim,
         "output_dim": model_config.output_dim,
         "degree": model_config.degree,
@@ -395,12 +443,15 @@ def extract_export_payload(model: KAN, config: Sine1DConfig) -> dict[str, object
         "num_intervals": model_config.num_intervals,
         "x_min": model_config.x_min,
         "x_max": model_config.x_max,
-        "knots": [float(value) for value in knots],
-        "control_points": [float(value) for value in control_points],
         "base_branch_disabled": model_config.disable_base_branch,
-        "scale_base": 0.0 if model_config.disable_base_branch else float(layer.scale_base.detach().cpu().reshape(-1)[0]),
-        "scale_sp": float(layer.scale_sp.detach().cpu().reshape(-1)[0]),
+        "layers": layers_payload,
     }
+    if len(layers_payload) == 1:
+        payload["knots"] = layers_payload[0]["knots"][0]
+        payload["control_points"] = layers_payload[0]["control_points"][0][0]
+        payload["scale_base"] = layers_payload[0]["scale_base"][0][0]
+        payload["scale_sp"] = layers_payload[0]["scale_sp"][0][0]
+    return payload
 
 
 @torch.no_grad()
@@ -477,7 +528,8 @@ def run(params_path: str | Path = DEFAULT_PARAMS_PATH) -> dict[str, object]:
 
     print(f"Config: {config.config_path}")
     print(f"Device: {device}")
-    print("Mini KAN [1,1] trained for sinusoidal regression")
+    width_label = "x".join(str(layer_width) for layer_width in config.model.width)
+    print(f"KAN {width_label} trained for sinusoidal regression")
     print(f"Train MSE: {metrics['train_mse']:.8f}")
     print(f"Validation MSE: {metrics['validation_mse']:.8f}")
     print(f"Test MSE: {metrics['test_mse']:.8f}")
