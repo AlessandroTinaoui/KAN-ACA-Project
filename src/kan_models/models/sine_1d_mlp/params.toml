@@ -1,5 +1,6 @@
 [function]
 name = "sin(2*pi*x) + 0.35*sin(10*pi*x)"
+expression = "sin(2*pi*x) + 0.35*sin(10*pi*x)"
 
 [[function.terms]]
 amplitude = 1.0

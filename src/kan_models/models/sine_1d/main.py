@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +15,11 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from kan_models.common.functions import (
+    RegressionFunction,
+    load_regression_function,
+    make_regression_dataset,
+)
 from kan_models.common.runtime import configure_matplotlib, detect_device, ensure_directory
 from kan_models.common.shared import clone_state_dict, load_toml, resolve_path, write_json
 
@@ -25,22 +29,6 @@ import matplotlib.pyplot as plt
 
 
 DEFAULT_PARAMS_PATH = Path(__file__).resolve().with_name("params.toml")
-
-
-@dataclass(frozen=True)
-class SineTerm:
-    """amplitude * sin(2*pi*frequency*x)."""
-
-    amplitude: float
-    frequency: float
-
-
-@dataclass(frozen=True)
-class FunctionConfig:
-    """Target function."""
-
-    name: str
-    terms: list[SineTerm]
 
 
 @dataclass(frozen=True)
@@ -125,7 +113,7 @@ class Sine1DConfig:
     """Full local configuration"""
 
     config_path: Path
-    function: FunctionConfig
+    function: RegressionFunction
     model: ModelConfig
     data: DataConfig
     training: TrainingConfig
@@ -142,18 +130,15 @@ def _required_section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     return section
 
 
-def _load_function_config(section: dict[str, Any]) -> FunctionConfig:
-    terms = [
-        SineTerm(amplitude=float(item["amplitude"]), frequency=float(item["frequency"]))
-        for item in section.get("terms", [])
-    ]
-    if not terms:
-        raise ValueError("At least one [[function.terms]] entry is required.")
-    return FunctionConfig(name=str(section.get("name", "custom_sine_function")), terms=terms)
+def _width_slug(width: list[int]) -> str:
+    """Return a filesystem-friendly label for a KAN width."""
+    return "_".join(str(layer_width) for layer_width in width)
 
 
-def _load_output_config(config_dir: Path, section: dict[str, Any]) -> OutputConfig:
-    output_dir = resolve_path(config_dir, section["output_dir"])
+def _load_output_config(config_dir: Path, section: dict[str, Any], model: ModelConfig) -> OutputConfig:
+    output_root = resolve_path(config_dir, section["output_dir"])
+    group_by_width = bool(section.get("group_by_width", True))
+    output_dir = output_root / f"kan_{_width_slug(model.width)}" if group_by_width else output_root
     return OutputConfig(
         output_dir=output_dir,
         export_json=output_dir / str(section["export_json"]),
@@ -189,13 +174,13 @@ def load_params(path: str | Path = DEFAULT_PARAMS_PATH) -> Sine1DConfig:
     config_path, raw = load_toml(path)
     config_dir = config_path.parent
 
-    function = _load_function_config(_required_section(raw, "function"))
+    function = load_regression_function(_required_section(raw, "function"))
     model = ModelConfig(**_required_section(raw, "model"))
     data = DataConfig(**_required_section(raw, "data"))
     training = TrainingConfig(**_required_section(raw, "training"))
     evaluation = EvaluationConfig(**_required_section(raw, "evaluation"))
     runtime = RuntimeConfig(**_required_section(raw, "runtime"))
-    output = _load_output_config(config_dir, _required_section(raw, "output"))
+    output = _load_output_config(config_dir, _required_section(raw, "output"), model)
 
     config = Sine1DConfig(
         config_path=config_path,
@@ -211,39 +196,18 @@ def load_params(path: str | Path = DEFAULT_PARAMS_PATH) -> Sine1DConfig:
     return config
 
 
-def target_function(x: torch.Tensor, config: FunctionConfig) -> torch.Tensor:
-    """Scalar function to approximate."""
-    y = torch.zeros_like(x)
-    for term in config.terms:
-        y = y + term.amplitude * torch.sin(2.0 * math.pi * term.frequency * x)
-    return y
-
-
 def make_dataset(config: Sine1DConfig, device: torch.device) -> dict[str, torch.Tensor]:
     """Build simple train/validation/test splits in [x_min, x_max]."""
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(config.data.seed)
-
-    x_min = config.model.x_min
-    x_max = config.model.x_max
-    train_x = torch.rand((config.data.train_samples, 1), generator=generator, dtype=torch.float32)
-    validation_x = torch.rand((config.data.validation_samples, 1), generator=generator, dtype=torch.float32)
-    test_x = torch.rand((config.data.test_samples, 1), generator=generator, dtype=torch.float32)
-    train_x = x_min + (x_max - x_min) * train_x
-    validation_x = x_min + (x_max - x_min) * validation_x
-    test_x = x_min + (x_max - x_min) * test_x
-    train_y = target_function(train_x, config.function)
-    validation_y = target_function(validation_x, config.function)
-    test_y = target_function(test_x, config.function)
-
-    return {
-        "train_input": train_x.to(device),
-        "train_label": train_y.to(device),
-        "validation_input": validation_x.to(device),
-        "validation_label": validation_y.to(device),
-        "test_input": test_x.to(device),
-        "test_label": test_y.to(device),
-    }
+    return make_regression_dataset(
+        config.function,
+        x_min=config.model.x_min,
+        x_max=config.model.x_max,
+        seed=config.data.seed,
+        train_samples=config.data.train_samples,
+        validation_samples=config.data.validation_samples,
+        test_samples=config.data.test_samples,
+        device=device,
+    )
 
 
 def build_model(config: Sine1DConfig, device: torch.device) -> KAN:
@@ -433,8 +397,10 @@ def extract_export_payload(model: KAN, config: Sine1DConfig) -> dict[str, object
         "model_type": "kan_spline_stack",
         "config_path": str(config.config_path),
         "function": config.function.name,
+        "function_expression": config.function.expression,
         "function_terms": [vars(term) for term in config.function.terms],
         "width": model_config.width,
+        "width_label": _width_slug(model_config.width),
         "input_dim": model_config.input_dim,
         "output_dim": model_config.output_dim,
         "degree": model_config.degree,
@@ -464,7 +430,7 @@ def save_fit_plot(model: KAN, output_file: Path, device: torch.device, config: S
         config.evaluation.plot_points,
         dtype=torch.float32,
     ).unsqueeze(1).to(device)
-    y_true = target_function(x_plot, config.function).cpu().numpy().reshape(-1)
+    y_true = config.function.value(x_plot).cpu().numpy().reshape(-1)
     y_pred = model(x_plot).cpu().numpy().reshape(-1)
 
     fig, ax = plt.subplots(figsize=(9, 4.8), constrained_layout=True)
